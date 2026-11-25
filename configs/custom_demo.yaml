@@ -1,0 +1,139 @@
+# =====================================================================
+# Twin-Rank 演示配置：使用 tools/make_demo_custom_data.py 生成的合成数据，端到端几分钟跑完。
+# 用法: python tools/make_demo_custom_data.py && 每个步骤加上 --config configs/custom_demo.yaml
+# 命令行可用 --config 指定其他配置文件，例如：--config configs/my_data.yaml
+# =====================================================================
+
+data:
+  source: custom                 # 数据来源：amazon = 下载 Amazon Reviews 2023；custom = 使用你自己的数据（见下方 custom）
+  category: Video_Games          # [amazon] 类目名；想快速试跑可换成 Digital_Music、Musical_Instruments 等小类目
+  review_url: https://mcauleylab.ucsd.edu/public_datasets/data/amazon_2023/raw/review_categories/{category}.jsonl.gz
+  meta_url: https://mcauleylab.ucsd.edu/public_datasets/data/amazon_2023/raw/meta_categories/meta_{category}.jsonl.gz
+  raw_dir: data/raw              # 原始下载文件目录
+  processed_dir: data/demo/processed  # 清洗后的交互与商品表
+  feature_dir: data/demo/features     # 编码器、物品特征、训练/验证/测试样本
+  artifact_dir: data/demo/artifacts   # 模型权重、物品向量、Faiss 索引、精排模型
+
+  # [custom] 使用自己的数据时填写；字段含义见 docs/USAGE.md 第 5 节
+  custom:
+    interactions_file: data/custom/interactions.csv   # 行为表：csv / tsv / parquet / jsonl
+    items_file: data/custom/items.csv                                   # 商品表（可选）；为空则不使用标题/品牌/价格等特征
+    columns:                                           # 把"你的列名"映射到标准列名（右边写你文件里的列名）
+      user_id: user_id
+      item_id: item_id
+      timestamp: timestamp                             # 数字(秒/毫秒)或日期字符串均可，只用于排序
+      rating: rating                                     # 没有评分列就写 null，所有行为都视为正样本
+    item_columns:
+      item_id: item_id
+      title: title
+      category: category
+      store: brand                                     # 品牌/店铺
+      price: price
+
+preprocess:
+  positive_rating: 4.0           # 评分 >= 该值视为正样本（隐式反馈：喜欢）
+  min_user_interactions: 5       # k-core 过滤：交互少于该值的用户被剔除（太少学不到偏好）
+  min_item_interactions: 5       # 交互少于该值的商品被剔除
+  max_review_rows: null          # 只读前 N 条评论，调试用（如 200000）；null = 全部
+
+features:
+  max_history_len: 20            # 用户历史序列保留最近多少个商品
+  top_stores: 2000               # 只保留出现次数最多的 N 个品牌，其余归为 other
+  n_price_buckets: 10            # 价格分位数分桶数
+  n_pop_buckets: 10              # 热度（训练集点击数）分位数分桶数
+
+model:
+  embedding_dim: 64              # ID embedding 维度（越大表达力越强，也越容易过拟合）
+  side_dim: 16                   # 类目/品牌/价格桶/热度桶 embedding 维度
+  hidden_dims: [128]             # 塔内 MLP 隐藏层，如 [256, 128] 表示两层
+  output_dim: 64                 # 用户/物品向量的最终维度（也是 Faiss 索引维度）
+  temperature: 0.05              # softmax 温度；越小越"尖锐"，对难负样本更敏感
+
+train:
+  batch_size: 256               # 同时也是 batch 内负样本数（越大负样本越多，更慢更占内存）
+  epochs: 10                     # 最大训练轮数（有早停）
+  lr: 0.001                      # Adam 学习率
+  weight_decay: 1.0e-6           # L2 正则
+  eval_ks: [10, 50, 100]         # 评估的 K 值
+  monitor_metric: recall_at_50   # 早停与选择最佳模型所依据的验证指标
+  patience: 3                    # 连续多少轮无提升则早停
+  device: auto                   # auto | cpu | cuda | mps（auto 会依次尝试 CUDA、Apple MPS、CPU）
+  seed: 42                       # 随机种子
+
+# ---------- 第 5 步：向量索引与多路召回 ----------
+retrieval:
+  index_type: flat               # flat = 精确检索（物品 < 100 万推荐）；hnsw = 近似检索（更快，略损精度）
+  hnsw_m: 32                     # [hnsw] 图的连接数，越大越准越占内存
+  hnsw_ef_search: 128            # [hnsw] 搜索宽度，越大越准越慢
+  n_candidates: 100              # 召回候选总数，精排只能在这些候选里排序（决定效果上限）
+  n_popular: 10                  # 其中由"热门路"补充的条数（其余来自双塔）
+
+# ---------- 第 6 步：LightGBM 精排 ----------
+ranker:
+  model_type: lightgbm           # 精排模型：lightgbm | deepfm | dcn | din（怎么选见 docs/USAGE.md 第 4.7 节）
+                                 # 也可临时用环境变量覆盖：TWIN_RANK_RANKER=din
+  objective: lambdarank          # [lightgbm] lambdarank = 直接优化排序（推荐）；binary = 点击率二分类
+  max_train_users: 30000         # 用多少个验证集用户构造精排训练样本（调试用小值，正式用大值）
+  valid_ratio: 0.2               # 其中多少比例做精排验证集
+  eval_users: 10000              # 用多少个测试集用户做端到端评估
+  eval_ks: [10, 20, 50]          # 端到端评估的 K 值
+  num_boost_round: 500           # 最大树棵数（有早停）
+  early_stopping_rounds: 30      # 验证指标连续多少轮无提升则停止
+  model_name: lightgbm_ranker.txt  # [lightgbm] 模型文件名（保存在 artifact_dir）
+  params:                        # [lightgbm] 直接传给 LightGBM
+    learning_rate: 0.05
+    num_leaves: 31
+    min_data_in_leaf: 50
+    feature_fraction: 0.9
+    bagging_fraction: 0.8
+    bagging_freq: 1
+  deep:                          # [deepfm / dcn / din] 深度精排的共用参数
+    embedding_dim: 16            # 每个特征字段的 embedding 维度
+    hidden_dims: [128, 64]       # DNN 隐藏层
+    dropout: 0.1                 # 防过拟合；数据少时可调大到 0.3
+    cross_layers: 3              # [dcn] 交叉层数 = 最高交叉阶数 - 1
+    attention_hidden: [64, 32]   # [din] 注意力网络隐藏层
+    batch_size: 2048
+    epochs: 10                   # 最大轮数（有早停）
+    lr: 0.001
+    weight_decay: 1.0e-6
+    patience: 2                  # 验证 NDCG@10 连续几轮无提升则停止
+    device: auto                 # auto | cpu | cuda | mps
+    model_name: deep_ranker_{model_type}.pt   # {model_type} 会替换成 deepfm / dcn / din
+
+# ---------- 第 7 步：重排与业务规则 ----------
+rerank:
+  enabled: true                  # 是否启用 MMR 多样性重排（关闭则按精排分数直接取 Top-K）
+  mmr_lambda: 0.7                # 0~1：越大越看重相关性，越小越看重多样性
+  max_same_store: 3              # 同一品牌最多出现几次；0 = 不限制
+  blacklist_items: []            # 黑名单：原始商品 ID 列表，永不推荐
+  pinned_items: []               # 运营置顶：原始商品 ID 列表，固定排在最前（用户已看过的会自动跳过）
+
+# ---------- 第 8 步：在线服务 ----------
+serving:
+  host: 0.0.0.0
+  port: 8100
+  sample_users: 50               # Demo 下拉框里展示的示例用户数
+  model_uri: null                # 为空：从本地 data/ 目录加载；
+                                 # 填 models:/twin-rank-recommender@champion：从 MLflow 注册表加载（也可用环境变量 TWIN_RANK_MODEL_URI）
+  cache:
+    enabled: true
+    ttl_seconds: 300             # 缓存过期时间
+    redis_url: null              # 如 redis://localhost:6379/0；为空或连接失败则用进程内缓存
+
+# ---------- MLflow ----------
+mlflow:
+  tracking_uri: null             # 为空则读取环境变量 MLFLOW_TRACKING_URI
+  experiment_name: twin-rank-demo
+  run_name: two-tower-v1         # 双塔训练的 run 名
+  ranker_run_name: ranker-v1     # 实际 run 名会自动加上模型类型，如 ranker-v1-din
+
+# ---------- 模型注册（MLflow Model Registry）----------
+registry:
+  model_name: twin-rank-demo   # 注册表中的模型名
+  alias: champion                     # 线上使用的版本；预测时用 models:/<名字>@champion 引用
+  challenger_alias: challenger        # 新训练但没超过 champion 的版本打这个别名，可单独试用
+  previous_alias: previous            # 被替换下来的上一任 champion，用于一键回滚
+  promote_metric: test_full_ndcg_at_10  # 用哪个端到端指标决定是否晋升（也可用 test_ranker_ndcg_at_10 等）
+  min_improvement: 0.0                # 新版本至少要高出多少才晋升；指标有随机波动时建议设 0.001 左右
+  run_name: register-twin-rank
