@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "twin-rank"
+version = "1.0.0"
+description = "Two-tower retrieval + pluggable ranking (LightGBM / DeepFM / DCN / DIN) + MMR re-ranking recommender"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy", "pandas", "pyarrow", "scipy", "pyyaml",
+  "torch", "mlflow", "certifi",
+  "faiss-cpu", "lightgbm",
+  "fastapi", "uvicorn", "redis",
+]
+
+[project.optional-dependencies]
+demo = ["reflex", "httpx"]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
